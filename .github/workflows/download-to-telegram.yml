@@ -20,7 +20,6 @@ concurrency:
 jobs:
   download-and-send:
     runs-on: ubuntu-latest
-
     timeout-minutes: 60
 
     steps:
@@ -45,6 +44,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FILE_URL: ${{ inputs.file_url }}
           FILE_NAME: ${{ inputs.file_name }}
+
         run: |
           python - <<'PY'
           import asyncio
@@ -82,14 +82,22 @@ jobs:
               return safe_filename(name) if name else "downloaded_file"
 
 
-          filename = safe_filename(CUSTOM_NAME) if CUSTOM_NAME else filename_from_url(FILE_URL)
+          filename = (
+              safe_filename(CUSTOM_NAME)
+              if CUSTOM_NAME
+              else filename_from_url(FILE_URL)
+          )
+
           filepath = DOWNLOAD_DIR / filename
 
           print(f"Baixando: {FILE_URL}")
           print(f"Arquivo: {filepath}")
 
           headers = {
-              "User-Agent": "Mozilla/5.0"
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 Chrome/151 Safari/537.36"
+              )
           }
 
           with requests.get(
@@ -106,26 +114,38 @@ jobs:
               downloaded = 0
 
               with open(filepath, "wb") as f:
-                  for chunk in response.iter_content(chunk_size=1024 * 1024):
-                      if chunk:
-                          f.write(chunk)
-                          downloaded += len(chunk)
+                  for chunk in response.iter_content(
+                      chunk_size=1024 * 1024
+                  ):
+                      if not chunk:
+                          continue
 
-                          if total:
-                              percent = downloaded * 100 / total
-                              print(
-                                  f"\rDownload: {percent:.1f}% "
-                                  f"({downloaded / 1024 / 1024:.1f} MB / "
-                                  f"{total / 1024 / 1024:.1f} MB)",
-                                  end="",
-                                  flush=True
-                              )
+                      f.write(chunk)
+                      downloaded += len(chunk)
+
+                      if total:
+                          percent = downloaded * 100 / total
+
+                          print(
+                              f"\rDownload: {percent:.1f}% "
+                              f"({downloaded / 1024 / 1024:.1f} MB / "
+                              f"{total / 1024 / 1024:.1f} MB)",
+                              end="",
+                              flush=True
+                          )
 
           print()
-          print(f"Download concluído: {filepath.stat().st_size / 1024 / 1024:.1f} MB")
+
+          size_mb = filepath.stat().st_size / 1024 / 1024
+
+          print(
+              f"Download concluído: "
+              f"{size_mb:.1f} MB"
+          )
 
 
           async def main():
+
               client = TelegramClient(
                   StringSession(SESSION),
                   API_ID,
@@ -134,32 +154,127 @@ jobs:
 
               await client.connect()
 
-              if not await client.is_user_authorized():
-                  raise RuntimeError("TELEGRAM_SESSION não está autenticada.")
+              try:
+                  if not await client.is_user_authorized():
+                      raise RuntimeError(
+                          "TELEGRAM_SESSION não está autenticada."
+                      )
 
-              me = await client.get_me()
-              print(f"Conectado ao Telegram como: {me.first_name}")
+                  me = await client.get_me()
 
-              print("Enviando arquivo para o Telegram...")
+                  print(
+                      f"Conectado ao Telegram como: "
+                      f"{me.first_name}"
+                  )
 
-              await client.send_file(
-                  CHAT_ID,
-                  str(filepath),
-                  caption=f"📦 {filename}",
-                  force_document=True
-              )
+                  print(
+                      "Carregando diálogos para localizar "
+                      "o destinatário..."
+                  )
 
-              print("Arquivo enviado com sucesso.")
+                  dialogs = await client.get_dialogs()
 
-              await client.disconnect()
+                  target = None
+
+                  for dialog in dialogs:
+                      if dialog.id == CHAT_ID:
+                          target = dialog.input_entity
+                          print(
+                              f"Destinatário localizado: "
+                              f"{dialog.name}"
+                          )
+                          break
+
+                  if target is None:
+                      print(
+                          f"CHAT_ID {CHAT_ID} não apareceu "
+                          "nos diálogos."
+                      )
+
+                      print(
+                          "Tentando localizar diretamente..."
+                      )
+
+                      try:
+                          target = await client.get_input_entity(
+                              CHAT_ID
+                          )
+
+                      except Exception as exc:
+                          raise RuntimeError(
+                              f"Não consegui localizar o CHAT_ID "
+                              f"{CHAT_ID}. "
+                              "Abra uma conversa entre a conta "
+                              "secundária e o destinatário e envie "
+                              "uma mensagem antes de executar "
+                              "novamente."
+                          ) from exc
+
+                  print(
+                      "Enviando arquivo para o Telegram..."
+                  )
+
+                  last_percent = -1
 
 
-          asyncio.run(main())
+                  def progress_callback(current, total):
+                      nonlocal last_percent
+
+                      if not total:
+                          return
+
+                      percent = int(
+                          current * 100 / total
+                      )
+
+                      if (
+                          percent != last_percent
+                          and (
+                              percent % 5 == 0
+                              or percent == 100
+                          )
+                      ):
+                          print(
+                              f"Upload Telegram: "
+                              f"{percent}% "
+                              f"({current / 1024 / 1024:.1f} MB / "
+                              f"{total / 1024 / 1024:.1f} MB)"
+                          )
+
+                          last_percent = percent
+
+
+                  await client.send_file(
+                      target,
+                      str(filepath),
+                      caption=f"📦 {filename}",
+                      force_document=True,
+                      progress_callback=progress_callback
+                  )
+
+                  print(
+                      "Arquivo enviado com sucesso."
+                  )
+
+              finally:
+                  await client.disconnect()
+
 
           try:
-              filepath.unlink()
-              print("Arquivo temporário apagado.")
-          except Exception as exc:
-              print(f"Não foi possível apagar o arquivo temporário: {exc}")
+              asyncio.run(main())
+
+          finally:
+              if filepath.exists():
+                  try:
+                      filepath.unlink()
+                      print(
+                          "Arquivo temporário apagado."
+                      )
+
+                  except Exception as exc:
+                      print(
+                          f"Não foi possível apagar o arquivo "
+                          f"temporário: {exc}"
+                      )
 
           PY
